@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("telegram-water")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+2e180df0f4204bdd7f999ec918b75ac802437cd6")]
 [assembly: System.Reflection.AssemblyProductAttribute("telegram-water")]
 [assembly: System.Reflection.AssemblyTitleAttribute("telegram-water")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

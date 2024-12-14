@@ -3,33 +3,29 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using StackExchange.Redis;
 using TelegramWaterBot.Models;
-using Microsoft.Extensions.Configuration;
 
 namespace TelegramWaterBot.Services
 {
     public class CacheService
     {
-        private readonly IDatabase _redis;
-        private readonly ConnectionMultiplexer _redisConnection;
+        private readonly ConnectionMultiplexer _redis;
 
-        public CacheService(IConfiguration configuration)
+        public CacheService(string configuration)
         {
-            var options = ConfigurationOptions.Parse(configuration.GetConnectionString("Redis"));
-            options.AbortOnConnectFail = false; // Don't fail if Redis is not available
-            options.ConnectTimeout = 5000; // 5 seconds
-            options.SyncTimeout = 5000;
-            
-            _redisConnection = ConnectionMultiplexer.Connect(options);
-            _redis = _redisConnection.GetDatabase();
+            if (string.IsNullOrEmpty(configuration))
+                throw new ArgumentNullException(nameof(configuration));
+
+            _redis = ConnectionMultiplexer.Connect(configuration);
         }
 
         public async Task SetUserState(long chatId, UserState state)
         {
             try
             {
+                var db = _redis.GetDatabase();
                 var key = $"user_state:{chatId}";
                 var value = JsonSerializer.Serialize(state);
-                await _redis.StringSetAsync(key, value, TimeSpan.FromHours(1));
+                await db.StringSetAsync(key, value, TimeSpan.FromHours(1));
             }
             catch (Exception ex)
             {
@@ -42,13 +38,15 @@ namespace TelegramWaterBot.Services
         {
             try
             {
-                var key = $"user_state:{chatId}";
-                var value = await _redis.StringGetAsync(key);
-                
-                if (value.IsNull)
+                var db = _redis.GetDatabase();
+                var value = await db.StringGetAsync($"user_state:{chatId}");
+
+                if (!value.HasValue)
                     return new UserState { ChatId = chatId, State = "Start" };
 
-                return JsonSerializer.Deserialize<UserState>(value);
+                var state = JsonSerializer.Deserialize<UserState>(value!) ?? 
+                           new UserState { ChatId = chatId, State = "Start" };
+                return state;
             }
             catch (Exception ex)
             {
@@ -61,8 +59,9 @@ namespace TelegramWaterBot.Services
         {
             try
             {
+                var db = _redis.GetDatabase();
                 var key = $"user_state:{chatId}";
-                await _redis.KeyDeleteAsync(key);
+                await db.KeyDeleteAsync(key);
             }
             catch (Exception ex)
             {
@@ -72,7 +71,7 @@ namespace TelegramWaterBot.Services
 
         public void Dispose()
         {
-            _redisConnection?.Dispose();
+            _redis?.Dispose();
         }
     }
 }

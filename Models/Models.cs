@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace TelegramWaterBot.Models
 {
@@ -9,6 +10,8 @@ namespace TelegramWaterBot.Models
         public string Description { get; set; } = string.Empty;
         public decimal Price { get; set; }
         public string? ImageUrl { get; set; } // Добавляем поле для URL изображения
+        public int StockQuantity { get; set; } // Добавляем поле для остатка
+        public bool IsAvailable { get; set; } = true; // Флаг доступности товара
     }
 
     public class Order
@@ -28,9 +31,10 @@ namespace TelegramWaterBot.Models
     public class UserState
     {
         public long ChatId { get; set; }
-        public string State { get; set; } = "Start";
+        public string? State { get; set; }
+        public Order? CurrentOrder { get; set; }
         public int? SelectedProductId { get; set; }
         public int? SelectedQuantity { get; set; }
-        public Order? CurrentOrder { get; set; }
+        public Dictionary<string, string> TempData { get; set; } = new Dictionary<string, string>();
     }
 }

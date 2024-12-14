@@ -12,32 +12,54 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.ReplyMarkups;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Polling;
+using Telegram.Bot.Exceptions;
 using TelegramWaterBot.Services;
 using TelegramWaterBot.Models;
+using System.Globalization;
 
 namespace TelegramWaterBot
 {
     public class Program
     {
+        private static AdminService _adminService = null!;
+
         public static async Task Main(string[] args)
         {
             var host = Host.CreateDefaultBuilder(args)
                 .ConfigureServices((context, services) =>
                 {
-                    // Add configuration
-                    services.AddSingleton<IConfiguration>(context.Configuration);
-
-                    // Add bot client
                     services.AddSingleton<ITelegramBotClient>(provider =>
                     {
-                        var config = provider.GetService<IConfiguration>();
-                        var token = config["BotConfiguration:BotToken"];
-                        return new TelegramBotClient(token);
+                        var config = provider.GetRequiredService<IConfiguration>();
+                        var token = config.GetSection("BotConfiguration")["BotToken"];
+                        return new TelegramBotClient(token ?? throw new InvalidOperationException("Bot token not found in configuration"));
                     });
 
-                    // Add services
-                    services.AddSingleton<DatabaseService>();
-                    services.AddSingleton<CacheService>();
+                    services.AddSingleton<DatabaseService>(provider =>
+                    {
+                        var config = provider.GetRequiredService<IConfiguration>();
+                        var connectionString = config.GetConnectionString("DefaultConnection");
+                        return new DatabaseService(connectionString ?? throw new InvalidOperationException("Database connection string not found"));
+                    });
+
+                    services.AddSingleton<CacheService>(provider =>
+                    {
+                        var config = provider.GetRequiredService<IConfiguration>();
+                        var redisConnection = config.GetConnectionString("Redis");
+                        return new CacheService(redisConnection ?? throw new InvalidOperationException("Redis connection string not found"));
+                    });
+
+                    services.AddSingleton<AdminService>(provider =>
+                    {
+                        var config = provider.GetRequiredService<IConfiguration>();
+                        var adminChatId = config.GetSection("BotConfiguration").GetValue<long>("AdminChatId");
+                        return new AdminService(
+                            provider.GetRequiredService<ITelegramBotClient>(),
+                            provider.GetRequiredService<DatabaseService>(),
+                            provider.GetRequiredService<CacheService>(),
+                            adminChatId);
+                    });
+
                     services.AddHostedService<BotService>();
                 })
                 .Build();
@@ -52,22 +74,25 @@ namespace TelegramWaterBot
         private readonly IConfiguration _configuration;
         private readonly DatabaseService _dbService;
         private readonly CacheService _cacheService;
+        private readonly AdminService _adminService;
 
         public BotService(
             ITelegramBotClient botClient,
             IConfiguration configuration,
             DatabaseService dbService,
-            CacheService cacheService)
+            CacheService cacheService,
+            AdminService adminService)
         {
             _botClient = botClient;
             _configuration = configuration;
             _dbService = dbService;
             _cacheService = cacheService;
+            _adminService = adminService;
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
         {
-            // Установка команд бота
+            var adminChatId = _configuration.GetSection("BotConfiguration").GetValue<long>("AdminChatId");
             var commands = new List<BotCommand>
             {
                 new BotCommand { Command = "start", Description = "Начать работу с ботом" },
@@ -76,14 +101,32 @@ namespace TelegramWaterBot
                 new BotCommand { Command = "order", Description = "Сделать заказ" },
                 new BotCommand { Command = "history", Description = "История заказов" }
             };
+
+            // Добавляем команду admin только для администратора
+            if (adminChatId > 0)
+            {
+                var adminCommands = new List<BotCommand>
+                {
+                    new BotCommand { Command = "admin", Description = "Панель администратора" }
+                };
+                var scope = new BotCommandScopeChat { ChatId = adminChatId };
+                await _botClient.SetMyCommandsAsync(adminCommands, scope, cancellationToken: cancellationToken);
+            }
+
             await _botClient.SetMyCommandsAsync(commands, cancellationToken: cancellationToken);
 
-            var receiverOptions = new ReceiverOptions { AllowedUpdates = { } };
+            var receiverOptions = new ReceiverOptions
+            {
+                AllowedUpdates = new[] { UpdateType.Message, UpdateType.CallbackQuery }
+            };
+
             _botClient.StartReceiving(
-                HandleUpdateAsync,
-                HandleErrorAsync,
-                receiverOptions,
-                cancellationToken);
+                updateHandler: HandleUpdateAsync,
+                pollingErrorHandler: HandleErrorAsync,
+                receiverOptions: receiverOptions,
+                cancellationToken: cancellationToken);
+
+            Console.WriteLine("Bot started successfully!");
         }
 
         private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
@@ -98,6 +141,15 @@ namespace TelegramWaterBot
                     if (message.Text?.StartsWith("/") == true)
                     {
                         await HandleCommand(message, cancellationToken);
+                        return;
+                    }
+
+                    if (message.Text?.StartsWith("/admin") == true || 
+                        message.Text?.StartsWith("/addproduct") == true ||
+                        message.Text?.StartsWith("/updatestock") == true ||
+                        message.Text?.StartsWith("/toggleproduct") == true)
+                    {
+                        await _adminService.HandleAdminCommand(message, cancellationToken);
                         return;
                     }
 
@@ -143,6 +195,14 @@ namespace TelegramWaterBot
             {
                 try
                 {
+                    if (callbackQuery.Data?.StartsWith("admin_") == true ||
+                        callbackQuery.Data?.StartsWith("update_stock_") == true ||
+                        callbackQuery.Data?.StartsWith("toggle_product_") == true)
+                    {
+                        await _adminService.HandleAdminCallback(callbackQuery, cancellationToken);
+                        return;
+                    }
+
                     await HandleCallbackQuery(callbackQuery, cancellationToken);
                 }
                 catch (Exception ex)
@@ -215,7 +275,7 @@ namespace TelegramWaterBot
                         {
                             var orderId = await _dbService.CreateOrder(userState.CurrentOrder);
                             await NotifyAdmin(
-                                _configuration.GetValue<long>("BotConfiguration:AdminChatId"),
+                                _configuration.GetSection("BotConfiguration").GetValue<long>("AdminChatId"),
                                 userState.CurrentOrder,
                                 orderId,
                                 cancellationToken);
@@ -279,9 +339,52 @@ namespace TelegramWaterBot
                 cancellationToken: cancellationToken);
         }
 
+        private async Task HandleMessageAsync(Message message, CancellationToken cancellationToken)
+        {
+            if (message?.Text == null)
+                return;
+
+            var userState = await _cacheService.GetUserState(message.Chat.Id);
+
+            if (userState.State?.StartsWith("Admin") == true)
+            {
+                await _adminService.HandleAdminState(message, userState.State, cancellationToken);
+                return;
+            }
+
+            if (message.Text.StartsWith('/'))
+            {
+                await HandleCommand(message, cancellationToken);
+                return;
+            }
+
+            switch (userState.State)
+            {
+                case "AwaitingQuantity":
+                    await HandleQuantityInput(message, userState, cancellationToken);
+                    break;
+                case "AwaitingPhoneNumber":
+                    await HandlePhoneNumberInput(message, userState, cancellationToken);
+                    break;
+                case "AwaitingAddress":
+                    await HandleAddressInput(message, userState, cancellationToken);
+                    break;
+                case "AwaitingDate":
+                    await HandleDateTimeInput(message, userState, cancellationToken);
+                    break;
+                default:
+                    await ShowMainMenu(message.Chat.Id, cancellationToken);
+                    break;
+            }
+        }
+
         private async Task HandleCommand(Message message, CancellationToken cancellationToken)
         {
-            switch (message.Text.ToLower())
+            if (message?.Text == null)
+                return;
+
+            var command = message.Text.Split(' ')[0].ToLower();
+            switch (command)
             {
                 case "/start":
                     await HandleStartCommand(message, cancellationToken);
@@ -293,13 +396,13 @@ namespace TelegramWaterBot
                     await ShowProducts(message.Chat.Id, cancellationToken);
                     break;
                 case "/order":
-                    var userState = await _cacheService.GetUserState(message.Chat.Id);
-                    userState.State = "SelectingProduct";
-                    await _cacheService.SetUserState(message.Chat.Id, userState);
                     await StartOrder(message.Chat.Id, cancellationToken);
                     break;
                 case "/history":
                     await ShowPastOrders(message.Chat.Id, cancellationToken);
+                    break;
+                case "/admin":
+                    await _adminService.HandleAdminCommand(message, cancellationToken);
                     break;
             }
         }
@@ -479,9 +582,27 @@ namespace TelegramWaterBot
 
         private async Task HandleQuantityInput(Message message, UserState userState, CancellationToken cancellationToken)
         {
+            if (message?.Text == null || !userState.SelectedProductId.HasValue)
+            {
+                await _botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Произошла ошибка. Пожалуйста, начните заказ заново.",
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
             if (int.TryParse(message.Text, out int quantity) && quantity > 0)
             {
                 var product = await _dbService.GetProduct(userState.SelectedProductId.Value);
+                if (product == null)
+                {
+                    await _botClient.SendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "Товар не найден. Пожалуйста, начните заказ заново.",
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
                 userState.SelectedQuantity = quantity;
                 userState.CurrentOrder = new Order
                 {
@@ -521,6 +642,15 @@ namespace TelegramWaterBot
 
         private async Task HandlePhoneNumberInput(Message message, UserState userState, CancellationToken cancellationToken)
         {
+            if (message?.Text == null || userState.CurrentOrder == null)
+            {
+                await _botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Произошла ошибка. Пожалуйста, начните заказ заново.",
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
             var phonePattern = new Regex(@"^\+79\d{9}$");
             if (!phonePattern.IsMatch(message.Text))
             {
@@ -543,11 +673,11 @@ namespace TelegramWaterBot
 
         private async Task HandleAddressInput(Message message, UserState userState, CancellationToken cancellationToken)
         {
-            if (string.IsNullOrWhiteSpace(message.Text))
+            if (message?.Text == null || userState.CurrentOrder == null)
             {
                 await _botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: "Пожалуйста, введите корректный адрес доставки.",
+                    text: "Произошла ошибка. Пожалуйста, начните заказ заново.",
                     cancellationToken: cancellationToken);
                 return;
             }
@@ -565,95 +695,74 @@ namespace TelegramWaterBot
 
         private async Task HandleDateTimeInput(Message message, UserState userState, CancellationToken cancellationToken)
         {
+            if (message?.Text == null || userState.CurrentOrder == null)
+            {
+                await _botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Произошла ошибка. Пожалуйста, начните заказ заново.",
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
             var dateTimePattern = new Regex(@"^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}$");
             if (!dateTimePattern.IsMatch(message.Text))
             {
                 await _botClient.SendTextMessageAsync(
                     chatId: message.Chat.Id,
-                    text: "Неверный формат даты и времени. Пожалуйста, используйте формат ДД.ММ.ГГГГ ЧЧ:ММ (например, 15.12.2024 14:30)",
+                    text: "Неверный формат даты и времени. Пожалуйста, используйте формат ДД.ММ.ГГГГ ЧЧ:ММ",
                     cancellationToken: cancellationToken);
                 return;
             }
 
-            var parts = message.Text.Split(' ');
-            if (parts.Length != 2)
+            if (DateTime.TryParseExact(message.Text, "dd.MM.yyyy HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime deliveryDateTime))
             {
-                await _botClient.SendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "Неверный формат даты и времени. Пожалуйста, используйте формат ДД.ММ.ГГГГ ЧЧ:ММ (например, 15.12.2024 14:30)",
-                    cancellationToken: cancellationToken);
-                return;
-            }
-
-            if (!DateTime.TryParseExact(parts[0], "dd.MM.yyyy", null, System.Globalization.DateTimeStyles.None, out DateTime deliveryDate))
-            {
-                await _botClient.SendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "Неверный формат даты. Пожалуйста, используйте формат ДД.ММ.ГГГГ (например, 15.12.2024)",
-                    cancellationToken: cancellationToken);
-                return;
-            }
-
-            if (!TimeSpan.TryParseExact(parts[1], "hh\\:mm", null, out TimeSpan deliveryTime))
-            {
-                await _botClient.SendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (например, 14:30)",
-                    cancellationToken: cancellationToken);
-                return;
-            }
-
-            var today = DateTime.Now.Date;
-            if (deliveryDate < today)
-            {
-                await _botClient.SendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "Дата доставки не может быть раньше текущей даты. Пожалуйста, выберите другую дату.",
-                    cancellationToken: cancellationToken);
-                return;
-            }
-
-            var minTime = new TimeSpan(9, 0, 0); // 9:00
-            var maxTime = new TimeSpan(21, 0, 0); // 21:00
-            if (deliveryTime < minTime || deliveryTime > maxTime)
-            {
-                await _botClient.SendTextMessageAsync(
-                    chatId: message.Chat.Id,
-                    text: "Доставка возможна только с 9:00 до 21:00. Пожалуйста, выберите другое время.",
-                    cancellationToken: cancellationToken);
-                return;
-            }
-
-            userState.CurrentOrder.DeliveryDate = deliveryDate;
-            userState.CurrentOrder.DeliveryTime = deliveryTime;
-            userState.State = "ConfirmingOrder";
-            await _cacheService.SetUserState(message.Chat.Id, userState);
-
-            // Показываем подтверждение заказа
-            var keyboard = new InlineKeyboardMarkup(new[]
-            {
-                new[] 
-                { 
-                    InlineKeyboardButton.WithCallbackData("✅ Подтвердить", "confirm_repeat"),
-                    InlineKeyboardButton.WithCallbackData("« Отмена", "menu")
+                if (deliveryDateTime <= DateTime.Now)
+                {
+                    await _botClient.SendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "Дата доставки должна быть в будущем.",
+                        cancellationToken: cancellationToken);
+                    return;
                 }
-            });
 
-            var product = await _dbService.GetProduct(userState.CurrentOrder.ProductId);
-            await _botClient.SendTextMessageAsync(
-                chatId: message.Chat.Id,
-                text: $"Проверьте детали заказа:\n" +
-                      $"🛍 Товар: {product?.Name}\n" +
-                      $"📦 Количество: {userState.CurrentOrder.Quantity}\n" +
-                      $"💰 Сумма: {userState.CurrentOrder.TotalPrice:C}\n" +
-                      $"📱 Телефон: {userState.CurrentOrder.PhoneNumber}\n" +
-                      $"📍 Адрес: {userState.CurrentOrder.DeliveryAddress}\n" +
-                      $"📅 Дата доставки: {userState.CurrentOrder.DeliveryDate:dd.MM.yyyy}\n" +
-                      $"⏰ Время доставки: {deliveryTime:hh\\:mm}\n\n" +
-                      $"Подтвердите заказ:",
-                replyMarkup: keyboard,
-                parseMode: ParseMode.Html,
-                cancellationToken: cancellationToken);
+                if (deliveryDateTime.Hour < 9 || deliveryDateTime.Hour >= 21)
+                {
+                    await _botClient.SendTextMessageAsync(
+                        chatId: message.Chat.Id,
+                        text: "Доставка возможна только с 9:00 до 21:00.",
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                userState.CurrentOrder.DeliveryDate = deliveryDateTime.Date;
+                userState.CurrentOrder.DeliveryTime = deliveryDateTime.TimeOfDay;
+                var orderId = await _dbService.SaveOrder(userState.CurrentOrder);
+
+                await NotifyAdmin(
+                    _configuration.GetSection("BotConfiguration").GetValue<long>("AdminChatId"),
+                    userState.CurrentOrder,
+                    orderId,
+                    cancellationToken);
+
+                userState.State = "Start";
+                userState.CurrentOrder = null;
+                userState.SelectedProductId = null;
+                await _cacheService.SetUserState(message.Chat.Id, userState);
+
+                await _botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Спасибо за заказ! Мы свяжемся с вами для подтверждения.",
+                    cancellationToken: cancellationToken);
+
+                await ShowMainMenu(message.Chat.Id, cancellationToken);
+            }
+            else
+            {
+                await _botClient.SendTextMessageAsync(
+                    chatId: message.Chat.Id,
+                    text: "Неверный формат даты и времени. Пожалуйста, используйте формат ДД.ММ.ГГГГ ЧЧ:ММ",
+                    cancellationToken: cancellationToken);
+            }
         }
 
         private async Task ShowPastOrders(long chatId, CancellationToken cancellationToken)
@@ -689,7 +798,8 @@ namespace TelegramWaterBot
                           $"Количество: {order.Quantity}\n" +
                           $"Сумма: {order.TotalPrice:C}\n" +
                           $"Статус: {order.Status}\n" +
-                          $"Дата доставки: {order.DeliveryDate:dd.MM.yyyy} {order.DeliveryTime:hh\\:mm}",
+                          $"Дата доставки: {order.DeliveryDate:dd.MM.yyyy}\n" +
+                          $"Время доставки: {order.DeliveryTime:hh\\:mm}",
                     replyMarkup: keyboard,
                     cancellationToken: cancellationToken);
             }
@@ -781,7 +891,14 @@ namespace TelegramWaterBot
 
         private Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
         {
-            Console.WriteLine($"Error occurred: {exception.Message}");
+            var ErrorMessage = exception switch
+            {
+                ApiRequestException apiRequestException
+                    => $"Telegram API Error:\n[{apiRequestException.ErrorCode}]\n{apiRequestException.Message}",
+                _ => exception.ToString()
+            };
+
+            Console.WriteLine(ErrorMessage);
             return Task.CompletedTask;
         }
 

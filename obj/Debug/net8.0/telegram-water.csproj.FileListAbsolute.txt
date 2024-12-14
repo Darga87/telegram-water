@@ -52,3 +52,4 @@
 /root/telegram-water/obj/Debug/net8.0/telegram-water.pdb
 /root/telegram-water/obj/Debug/net8.0/telegram-water.genruntimeconfig.cache
 /root/telegram-water/obj/Debug/net8.0/ref/telegram-water.dll
+/root/telegram-water/obj/Debug/net8.0/telegram-water.sourcelink.json
