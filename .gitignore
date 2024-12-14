@@ -97,3 +97,6 @@ _ReSharper*/
 appsettings.Development.json
 appsettings.Production.json
 appsettings.json
+bin/
+obj/
+.git-credentials
