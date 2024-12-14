@@ -1,0 +1,5 @@
+/root/telegram-water/obj/Debug/net7.0/telegram-water.csproj.AssemblyReference.cache
+/root/telegram-water/obj/Debug/net7.0/telegram-water.GeneratedMSBuildEditorConfig.editorconfig
+/root/telegram-water/obj/Debug/net7.0/telegram-water.AssemblyInfoInputs.cache
+/root/telegram-water/obj/Debug/net7.0/telegram-water.AssemblyInfo.cs
+/root/telegram-water/obj/Debug/net7.0/telegram-water.csproj.CoreCompileInputs.cache
